@@ -104,7 +104,7 @@ static const char index_html[] PROGMEM = R"EOF(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 Controle de Voz (Gemini)</title>
+    <title>ESP32 Controle de Voz (Gemini + Firebase)</title>
     <style>
         /* [O CSS permanece o mesmo] */
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; background: #f0f2f5; margin-top: 50px; color: #333; }
@@ -115,6 +115,8 @@ static const char index_html[] PROGMEM = R"EOF(
         #transcript { font-size: 1.2em; margin-top: 30px; min-height: 100px; max-width: 600px; margin-left: auto; margin-right: auto; border: 1px solid #ddd; background: #ffffff; padding: 20px; border-radius: 8px; text-align: left; }
         #transcript i { color: #999; }
         #status { font-size: 1.1em; color: #555; margin-top: 20px; font-style: italic; }
+        /* Novo: Display do estado Firebase */
+        #firebaseStatus { font-size: 0.9em; color: #2ecc71; margin-top: 10px; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -123,190 +125,241 @@ static const char index_html[] PROGMEM = R"EOF(
     <button id="micButton">▶ Falar</button>
     <div id="transcript">...</div>
     <div id="status">Aguardando comando.</div>
+    <div id="firebaseStatus">Firebase: Desconectado</div>
 
     <script type="module">
-        // ======================================
-        // IMPORTA A BIBLIOTECA DO GEMINI
-        // ======================================
-        import { GoogleGenerativeAI } from 'https://esm.run/@google/generative-ai';
+import { GoogleGenerativeAI } from 'https://esm.run/@google/generative-ai';
+import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.2/firebase-app.js";
+import { getDatabase, ref, set, push, onValue } from "https://www.gstatic.com/firebasejs/9.22.2/firebase-database.js";
 
-        // ======================================
-        // CONFIGURAÇÃO DA API DA LLM
-        // ======================================
-        // ❗ (Sua Chave de API)
-        const GEMINI_API_KEY = "AIzaSyByq5zji1RG240zSODkYS8JTbJmP8xhLlM"; 
-        
-        // ==========================================================
-        // PROMPT DO SISTEMA
-        // ==========================================================
-        const systemPrompt = "Eu quero que você identifique essa frase, e se a intenção da frase for de ligar, responda apenas com a palavra 'LIGAR'. Se a intenção for de desligar, responda apenas com a palavra 'DESLIGAR'. Se não for possível identificar claramente, responda apenas com 'NÃO ENTENDI'.";
+// ======================================
+// CONFIGURAÇÃO DO FIREBASE
+// ======================================
+const firebaseConfig = {
+    apiKey: "AIzaSyCsi9KSMvNGuy-H3990FKC2iCxDjfo_fpk",
+    authDomain: "esp32-31a2e.firebaseapp.com",
+    databaseURL: "https://esp32-31a2e-default-rtdb.firebaseio.com",
+    projectId: "esp32-31a2e",
+    storageBucket: "esp32-31a2e.firebasestorage.app",
+    messagingSenderId: "412403888397",
+    appId: "1:412403888397:web:b61f3961ec9196ed9d4044"
+};
 
-        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-        const model = genAI.getGenerativeModel({ 
-            model: "gemini-2.5-flash"
-        });
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+// Ref: O valor atual do relé que o ESP32 deve monitorar
+const lampRef = ref(db, "lamp/atual");
+// Ref: Histórico dos comandos
+const historyRef = ref(db, "lamp/historico");
 
-        // ======================================
-        // ELEMENTOS DO HTML
-        // ======================================
-        const btn = document.getElementById('micButton');
-        const output = document.getElementById('transcript');
-        const statusEl = document.getElementById('status');
-        let isRecording = false;
+// Listener simples para confirmar a conexão com o Firebase
+onValue(lampRef, (snapshot) => {
+    document.getElementById('firebaseStatus').innerText = `Firebase: Conectado. Estado atual: ${snapshot.val() || 'N/A'}`;
+}, {
+    onlyOnce: true
+});
 
-        // ======================================
-        // CONFIGURAÇÃO DO SPEECH RECOGNITION
-        // ======================================
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        let recognition;
+// ======================================
+// CONFIGURAÇÃO DA API DA LLM
+// ======================================
+const GEMINI_API_KEY = "AIzaSyByq5zji1RG240zSODkYS8JTbJmP8xhLlM";
+// PROMPT DO SISTEMA (Permanece o mesmo)
+const systemPrompt = "Eu quero que você identifique essa frase, e se a intenção da frase for de ligar, responda apenas com a palavra 'LIGAR'. Se a intenção for de desligar, responda apenas com a palavra 'DESLIGAR'. Se não for possível identificar claramente, responda apenas com 'NÃO ENTENDI'.";
 
-        if (!SpeechRecognition) {
-            output.innerHTML = "Seu navegador não suporta a API de Reconhecimento de Fala. Tente o Chrome ou Edge.";
-            btn.disabled = true;
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash"
+});
+
+// ======================================
+// ELEMENTOS DO HTML
+// ======================================
+const btn = document.getElementById('micButton');
+const output = document.getElementById('transcript');
+const statusEl = document.getElementById('status');
+let isRecording = false;
+
+// ======================================
+// CONFIGURAÇÃO DO SPEECH RECOGNITION
+// ======================================
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition;
+
+if (!SpeechRecognition) {
+    output.innerHTML = "Seu navegador não suporta a API de Reconhecimento de Fala. Tente o Chrome ou Edge.";
+    btn.disabled = true;
+} else {
+    recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'pt-BR';
+
+    let finalTranscript = '';
+
+    recognition.onresult = (event) => {
+        let interimTranscript = '';
+        finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const transcriptPart = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+                finalTranscript += transcriptPart;
+            } else {
+                interimTranscript += transcriptPart;
+            }
+        }
+        output.innerHTML = finalTranscript + '<i style="color:gray;">' + interimTranscript + '</i>';
+    };
+
+    recognition.onend = () => {
+        isRecording = false;
+        btn.innerHTML = '▶ Falar';
+        btn.classList.remove('recording');
+        statusEl.innerText = "Aguardando comando.";
+    };
+
+    recognition.onerror = (event) => {
+        console.error("Erro no SpeechRecognition: ", event.error);
+        if (event.error === 'not-allowed') {
+            statusEl.innerText = "Permissão ao microfone negada.";
+        } else if (event.error === 'no-speech') {
+            statusEl.innerText = "Nenhuma fala detectada.";
+        }
+        // Força o reset do botão
+        isRecording = false;
+        btn.innerHTML = '▶ Falar';
+        btn.classList.remove('recording');
+    };
+
+    // ======================================
+    // LÓGICA PRINCIPAL (Botão e API)
+    // ======================================
+    btn.onclick = () => {
+        if (isRecording) {
+            // --- PARAR DE GRAVAR ---
+            recognition.stop();
+            statusEl.innerText = "Processando...";
+
+            if (finalTranscript) {
+                callGemini(finalTranscript);
+            } else {
+                statusEl.innerText = "Nenhum texto capturado. Tente novamente.";
+            }
+
         } else {
-            recognition = new SpeechRecognition();
-            recognition.continuous = true;
-            recognition.interimResults = true;
-            recognition.lang = 'pt-BR';
-
-            let finalTranscript = '';
-
-            recognition.onresult = (event) => {
-                let interimTranscript = '';
-                finalTranscript = ''; 
-
-                for (let i = event.resultIndex; i < event.results.length; ++i) {
-                    const transcriptPart = event.results[i][0].transcript;
-                    if (event.results[i].isFinal) {
-                        finalTranscript += transcriptPart;
-                    } else {
-                        interimTranscript += transcriptPart;
-                    }
-                }
-                output.innerHTML = finalTranscript + '<i style="color:gray;">' + interimTranscript + '</i>';
-            };
-
-            recognition.onend = () => {
-                isRecording = false;
-                btn.innerHTML = '▶ Falar';
-                btn.classList.remove('recording');
-            };
-            
-            recognition.onerror = (event) => {
-                console.error("Erro no SpeechRecognition: ", event.error);
-                if (event.error === 'not-allowed') {
-                    statusEl.innerText = "Permissão ao microfone negada.";
-                } else if (event.error === 'no-speech') {
-                    statusEl.innerText = "Nenhuma fala detectada.";
-                }
-            };
-
-            // ======================================
-            // LÓGICA PRINCIPAL (Botão e API)
-            // ======================================
-            btn.onclick = () => {
-                if (isRecording) {
-                    // --- PARAR DE GRAVAR ---
-                    recognition.stop();
-                    statusEl.innerText = "Processando...";
-                    
-                    if (finalTranscript) {
-                        callGemini(finalTranscript);
-                    } else {
-                        statusEl.innerText = "Nenhum texto capturado. Tente novamente.";
-                    }
-
-                } else {
-                    // --- COMEÇAR A GRAVAR ---
-                    finalTranscript = ''; 
-                    output.innerHTML = 'Ouvindo...';
-                    statusEl.innerText = "Fale agora.";
-                    try {
-                        recognition.start();
-                        isRecording = true;
-                        btn.innerHTML = '⏹ Parar';
-                        btn.classList.add('recording');
-                    } catch (err) {
-                        console.error("Erro ao tentar iniciar: ", err);
-                        statusEl.innerText = "Erro ao iniciar. Tente novamente.";
-                    }
-                }
-            };
-        }
-
-        // ======================================
-        // FUNÇÃO DA LLM (GEMINI)
-        // ======================================
-        async function callGemini(userText) {
-            
+            // --- COMEÇAR A GRAVAR ---
+            finalTranscript = '';
+            output.innerHTML = 'Ouvindo...';
+            statusEl.innerText = "Fale agora.";
             try {
-                const fullPrompt = `${systemPrompt}\n\nTexto do usuário: "${userText}"`;
-                
-                const result = await model.generateContent(fullPrompt);
-                const response = result.response;
-                
-                let command = response.text().trim().toUpperCase();
-                console.log('Resposta bruta da LLM:', response.text());
-                
-                statusEl.innerText = `Comando recebido: ${command}`;
-                handleCommand(command);
-
-            } catch (error) {
-                console.error('Erro ao chamar Gemini:', error);
-                statusEl.innerText = 'Erro ao conectar com a IA.';
-                if (error.message.includes('API key not valid')) {
-                    statusEl.innerText = 'Erro: Chave de API do Gemini inválida!';
-                } else if (error.message.includes('400')) {
-                     statusEl.innerText = 'Erro 400: Requisição mal formatada. Verifique sua Chave de API.';
-                }
+                recognition.start();
+                isRecording = true;
+                btn.innerHTML = '⏹ Parar';
+                btn.classList.add('recording');
+            } catch (err) {
+                console.error("Erro ao tentar iniciar: ", err);
+                statusEl.innerText = "Erro ao iniciar. Tente novamente.";
             }
         }
+    };
+}
 
-        // ==========================================================
-        // FUNÇÃO FETCH PARA CONTROLAR O RELÉ
-        // ==========================================================
-        async function sendRelayCommand(endpoint) {
-            try {
-                // Faz a requisição para o ESP32 (ex: /ligar ou /desligar)
-                const response = await fetch(endpoint); 
-                
-                if (!response.ok) {
-                    throw new Error(`Erro na requisição: ${response.statusText}`);
-                }
-                
-                // Pega a resposta (ex: "Relay LIGADO") e mostra no status
-                const resultText = await response.text();
-                console.log(`Resposta do ESP32: ${resultText}`);
-                statusEl.innerText = resultText; // Atualiza o status com a resposta do ESP
+// ======================================
+// FUNÇÃO DA LLM (GEMINI)
+// ======================================
+async function callGemini(userText) {
 
-            } catch (error) {
-                console.error('Erro ao enviar comando para o ESP32:', error);
-                statusEl.innerText = 'Erro ao controlar o relé.';
-            }
+    try {
+        const fullPrompt = `${systemPrompt}\n\nTexto do usuário: "${userText}"`;
+
+        const result = await model.generateContent(fullPrompt);
+        const response = result.response;
+
+        let command = response.text().trim().toUpperCase();
+        console.log('Resposta bruta da LLM:', response.text());
+
+        statusEl.innerText = `Comando recebido: ${command}`;
+        handleCommand(command, userText);
+    } catch (error) {
+        console.error('Erro ao chamar Gemini:', error);
+        statusEl.innerText = 'Erro ao conectar com a IA.';
+        if (error.message.includes('API key not valid')) {
+            statusEl.innerText = 'Erro: Chave de API do Gemini inválida!';
+        } else if (error.message.includes('400')) {
+            statusEl.innerText = 'Erro 400: Requisição mal formatada. Verifique sua Chave de API.';
+        }
+    }
+}
+
+// ==========================================================
+// FUNÇÃO DE ATUALIZAÇÃO DO FIREBASE
+// ==========================================================
+function updateFirebase(command, userText) {
+    const now = new Date().toISOString();
+    const estado = (command === 'LIGAR') ? "ON" : (command === 'DESLIGAR' ? "OFF" : "NAO ENTENDI");
+
+    // 1. Atualiza o estado atual (para o ESP32 ler)
+    set(lampRef, estado)
+        .then(() => console.log(`Firebase atualizado: lamp/atual = ${estado}`))
+        .catch(err => console.error("Erro ao escrever lamp/atual:", err));
+
+    // 2. Registra no histórico (para registro)
+    const historyData = {
+        comando: command,
+        userText: userText,
+        estado: estado,
+        timestamp: now
+    };
+    push(historyRef, historyData)
+        .then(() => console.log("Comando registrado no histórico do Firebase."))
+        .catch(err => console.error("Erro ao escrever histórico:", err));
+}
+
+// ==========================================================
+// FUNÇÃO FETCH PARA CONTROLAR O RELÉ
+// ==========================================================
+async function sendRelayCommand(endpoint) {
+    try {
+        // ATENÇÃO: Se estiver em rede local, use o IP real do ESP32, ex: 'http://192.168.1.100/ligar'
+        const ESP32_BASE_URL = window.location.origin; // Assume que o ESP32 está servindo esta página. Mude para o IP se necessário.
+
+        const response = await fetch(ESP32_BASE_URL + endpoint);
+
+        if (!response.ok) {
+            throw new Error(`Erro na requisição: ${response.statusText} (${response.status})`);
         }
 
+        const resultText = await response.text();
+        console.log(`Resposta do ESP32: ${resultText}`);
+        statusEl.innerText = `ESP32: ${resultText}`; // Atualiza o status com a resposta do ESP
 
-        // ==========================================================
-        // O BLOCO IF/ELSE
-        // ==========================================================
-        function handleCommand(command) {
-            console.log('Comando processado pela LLM:', command);
-            
-            if (command === 'LIGAR') {
-                console.log('AÇÃO: LIGAR');
-                statusEl.innerText = 'Enviando comando LIGAR...';
-                sendRelayCommand('/ligar'); 
-                
-            } else if (command === 'DESLIGAR') {
-                console.log('AÇÃO: DESLIGAR');
-                statusEl.innerText = 'Enviando comando DESLIGAR...';
-                sendRelayCommand('/desligar'); 
-                
-            } else { // 'NÃO ENTENDI'
-                console.log('AÇÃO: NÃO ENTENDI');
-                statusEl.innerText = 'Comando não reconhecido. Tente novamente.'; 
-            }
-        }
+    } catch (error) {
+        console.error('Erro ao enviar comando para o ESP32:', error);
+        statusEl.innerText = `Erro ao controlar o relé: ${error.message}`;
+    }
+}
+
+
+// ==========================================================
+// O BLOCO IF/ELSE (Com integração Firebase)
+// ==========================================================
+function handleCommand(command, userText) {
+    console.log('Comando processado pela LLM:', command);
+
+    if (command === 'LIGAR') {
+        statusEl.innerText = 'Enviando comando LIGAR para ESP32 e Firebase...';
+        sendRelayCommand('/ligar');
+        updateFirebase(command, userText);
+    } else if (command === 'DESLIGAR') {
+        statusEl.innerText = 'Enviando comando DESLIGAR para ESP32 e Firebase...';
+        sendRelayCommand('/desligar');
+        updateFirebase(command, userText);
+    } else { // 'NÃO ENTENDI'
+        console.log('AÇÃO: NÃO ENTENDI');
+        statusEl.innerText = 'Comando não reconhecido. Tente novamente.';
+        updateFirebase(command, userText);
+    }
+}
     </script>
 </body>
 </html>
