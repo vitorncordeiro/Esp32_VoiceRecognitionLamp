@@ -30,7 +30,6 @@ This structure separates responsibilities:
 * Voice-controlled lamp switching using **Gemini AI**
 * Local HTTPS web interface served by the **ESP32**
 * Firebase integration handled by **JavaScript**
-* **Manual** and **Automatic** operation modes
 * Real-time logging of energy consumption and cost
 * Automatic time synchronization via **NTP**
 
